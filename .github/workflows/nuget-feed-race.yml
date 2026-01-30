@@ -1,0 +1,95 @@
+name: nuget feed race poc
+
+on:
+  workflow_dispatch:
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Build two tools with same PackageId+Version into two local feeds
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/nuget-race && mkdir -p /tmp/nuget-race/{A,B,ToolA,ToolB}
+
+          cat > /tmp/nuget-race/ToolA/ToolA.csproj <<'CS'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <PackAsTool>true</PackAsTool>
+              <ToolCommandName>gef-poc</ToolCommandName>
+              <PackageId>Azure.Sdk.Tools.GitHubEventProcessor</PackageId>
+              <Version>1.0.0-dev.20260129.1</Version>
+            </PropertyGroup>
+          </Project>
+CS
+          cat > /tmp/nuget-race/ToolA/Program.cs <<'CS'
+          using System;
+          Console.WriteLine("POC: installed from FEED A");
+CS
+          dotnet pack /tmp/nuget-race/ToolA/ToolA.csproj -c Release -o /tmp/nuget-race/A
+
+          dotnet new console -n ToolB -o /tmp/nuget-race/ToolB >/dev/null
+          cat > /tmp/nuget-race/ToolB/ToolB.csproj <<'CS'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net8.0</TargetFramework>
+              <PackAsTool>true</PackAsTool>
+              <ToolCommandName>gef-poc</ToolCommandName>
+              <PackageId>Azure.Sdk.Tools.GitHubEventProcessor</PackageId>
+              <Version>1.0.0-dev.20260129.1</Version>
+            </PropertyGroup>
+          </Project>
+CS
+          cat > /tmp/nuget-race/ToolB/Program.cs <<'CS'
+          using System;
+          Console.WriteLine("POC: installed from FEED B");
+CS
+          dotnet pack /tmp/nuget-race/ToolB/ToolB.csproj -c Release -o /tmp/nuget-race/B
+
+          ls -ლა /tmp/nuget-race/A /tmp/nuget-race/B
+
+      - name: Run installs 20x and count which feed wins
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="Azure.Sdk.Tools.GitHubEventProcessor"
+          VER="1.0.0-dev.20260129.1"
+          TPBASE="/tmp/tp-runs"
+          rm -rf "$TPBASE" && mkdir -p "$TPBASE"
+
+          # Add both feeds as enabled sources (like “multiple enabled feeds” real life)
+          dotnet nuget remove source FeedA >/dev/null 2>&1 || true
+          dotnet nuget remove source FeedB >/dev/null 2>&1 || true
+          dotnet nuget add source "/tmp/nuget-race/A" -n FeedA
+          dotnet nuget add source "/tmp/nuget-race/B" -n FeedB
+          dotnet nuget list source
+
+          # Run multiple installs with caches cleared to amplify nondeterminism
+          outcomes=()
+          for i in $(seq -w 1 20); do
+            TP="$TPBASE/$i"
+            rm -rf "$TP" && mkdir -p "$TP"
+            dotnet nuget locals all --clear >/dev/null
+
+            dotnet tool install "$PKG" --version "$VER" \
+              --tool-path "$TP" \
+              --add-source "/tmp/nuget-race/A" >/dev/null
+
+            out=$("$TP/gef-poc")
+            echo "$i: $out"
+            outcomes+=("$out")
+          done
+
+          echo
+          echo "=== counts ==="
+          printf "%s\n" "${outcomes[@]}" | sort | uniq -c
